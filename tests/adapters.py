@@ -31,7 +31,8 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    raise NotImplementedError
+    from cs336_alignment.sft import tokenize_prompt_and_output
+    return tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
 
 
 def run_compute_group_normalized_rewards(
@@ -82,7 +83,8 @@ def run_compute_group_normalized_rewards(
 
 def run_compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Get the entropy of the logits (i.e., entropy of the final dimension)."""
-    raise NotImplementedError
+    from cs336_alignment.sft import compute_entropy
+    return compute_entropy(logits)
 
 
 def run_get_response_log_probs(
@@ -90,7 +92,7 @@ def run_get_response_log_probs(
     input_ids: torch.Tensor,
     labels: torch.Tensor,
     return_token_entropy: bool,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     """Get the conditional log-probs of the response given the prompt,
         and optionally the entropy of the next token predictions.
 
@@ -114,7 +116,8 @@ def run_get_response_log_probs(
                 we have not masked out the token indices corresponding to the prompt
                 or padding; that is done in the train loop.
     """
-    raise NotImplementedError
+    from cs336_alignment.sft import get_response_log_probs
+    return get_response_log_probs(model, input_ids, labels, return_token_entropy)  # ty:ignore[invalid-argument-type]
 
 
 def run_compute_naive_policy_gradient_loss(
