@@ -10,9 +10,10 @@ from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    PreTrainedModel,
     get_scheduler,
 )
+from transformers.modeling_utils import PreTrainedModel
+from transformers.tokenization_utils import PreTrainedTokenizer
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
@@ -70,7 +71,7 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     """
     Sync weights from the PyTorch SFT policy directly into the vLLM engine instance.
     """
-    state_dict = policy.state_dict()  # ty:ignore[unresolved-attribute]
+    state_dict = policy.state_dict()
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model  # ty:ignore[unresolved-attribute]
     llm_model.load_weights(state_dict.items())
 
@@ -143,7 +144,7 @@ def evaluate_vllm_loop(
     }
     sampling_params = SamplingParams(
         temperature=1.0,
-        max_tokens=1024,
+        max_tokens=2048,
         stop=["</answer>"],
         include_stop_str_in_output=True,
     )
@@ -169,6 +170,141 @@ def filter_sft_data(input_path, output_path):
                 f_out.write(json.dumps(item) + "\n")
                 correct_count += 1
     logger.info(f"Filter the reasoning SFT examples, keep {correct_count}.")
+
+
+def sft_train_loop(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    train_records: list[dict],
+    *,
+    device: str,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    learning_rate: float,
+    epochs: int,
+    warmup_steps: int,
+    max_grad_norm: float,
+    start_step: int = 0,
+    eval_steps: int | None = None,
+    vllm_engine: LLM | None = None,
+    val_records: list[dict[str, str]] | None = None,
+    output_dir: str | None = None,
+):
+    """
+    Reusable SFT training loop. Used by both standalone SFT and Expert Iteration.
+
+    If vllm_engine / val_records / output_dir are provided, periodic eval and
+    checkpointing are performed every `eval_steps` gradient updates.
+    """
+    train_loader = DataLoader(
+        train_records,  # ty:ignore[invalid-argument-type]
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=lambda b: collate_fn(b, tokenizer),
+    )
+
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+
+    total_steps = (
+        len(train_loader) * epochs + gradient_accumulation_steps - 1
+    ) // gradient_accumulation_steps
+    if total_steps == 0:
+        logger.warning("Too few examples for a full gradient step — skipping.")
+        return 0
+
+    logger.info(f"Starting SFT for {total_steps} gradient steps ({epochs} epochs).")
+
+    scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
+    optimizer.zero_grad()
+
+    train_step = start_step
+    eval_step = 0
+    accumulated_loss = 0.0
+    accumulated_entropy = 0.0
+    accumulate_count = 0
+
+    model.train()
+    for epoch in range(epochs):
+        for idx, batch_tensors in enumerate(train_loader):
+            input_ids = batch_tensors["input_ids"].to(device)
+            labels = batch_tensors["labels"].to(device)
+            response_mask = batch_tensors["response_mask"].to(device)
+
+            log_probs_output = get_response_log_probs(
+                model=model,
+                input_ids=input_ids,
+                labels=labels,
+                return_token_entropy=True,
+            )
+
+            _, metadata = sft_microbatch_train_step(
+                policy_log_probs=log_probs_output["log_probs"],
+                response_mask=response_mask,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                normalize_constant=response_mask.sum(dim=-1),
+            )
+
+            accumulated_loss += metadata["loss"].item() / gradient_accumulation_steps
+            accumulated_entropy += (
+                log_probs_output.get("token_entropy", torch.tensor(0.0)).mean().item()
+                / gradient_accumulation_steps
+            )
+
+            accumulate_count += 1
+            is_last_step = (epoch == epochs - 1) and (idx == len(train_loader) - 1)
+
+            if accumulate_count == gradient_accumulation_steps or is_last_step:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_grad_norm
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                train_step += 1
+                accumulate_count = 0
+
+                wandb.log(
+                    {
+                        "train_step": train_step,
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/loss": accumulated_loss,
+                        "train/token_entropy": accumulated_entropy,
+                        "train/grad_norm": grad_norm.item()
+                        if not isinstance(grad_norm, float)
+                        else grad_norm,
+                    }
+                )
+                logger.info(
+                    f"Epoch {epoch} | Step {train_step} | Loss: {accumulated_loss:.4f}"
+                )
+                accumulated_loss = 0.0
+                accumulated_entropy = 0.0
+
+                # Periodic evaluation & checkpoint (optional)
+                if (
+                    vllm_engine is not None
+                    and val_records is not None
+                    and eval_steps
+                    and (train_step % eval_steps == 0 or train_step == total_steps)
+                ):
+                    eval_step += 1
+                    model.eval()
+                    accuracy = evaluate_vllm_loop(model, vllm_engine, val_records)
+                    wandb.log({"eval_step": eval_step, "eval/accuracy": accuracy})
+                    if output_dir:
+                        save_path = os.path.join(output_dir, f"checkpoint-{train_step}")
+                        model.save_pretrained(save_path)
+                        tokenizer.save_pretrained(save_path)
+                        logger.info(f"Saved checkpoint to {save_path}")
+                    model.train()
+
+    torch.cuda.empty_cache()
+    return train_step
 
 
 def main():
@@ -239,114 +375,22 @@ def main():
         min(512, args.num_eval_batches * args.batch_size * 4),
     )
 
-    train_loader = DataLoader(
-        train_records,  # ty:ignore[invalid-argument-type]
+    sft_train_loop(
+        model=model,
+        tokenizer=tokenizer,
+        train_records=train_records,
+        device=str(device),
         batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=lambda b: collate_fn(b, tokenizer),
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        epochs=args.epochs,
+        warmup_steps=args.warmup_steps,
+        max_grad_norm=args.max_grad_norm,
+        eval_steps=args.eval_steps,
+        vllm_engine=vllm_engine,
+        val_records=val_records,
+        output_dir=args.output_dir,
     )
-
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-
-    train_step = 0
-    eval_step = 0
-    model.train()
-
-    total_steps = len(train_loader) * args.epochs // args.gradient_accumulation_steps
-    logger.info(f"Starting training for {total_steps} actual steps.")
-
-    scheduler = get_scheduler(
-        name="cosine",
-        optimizer=optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=total_steps,
-    )
-
-    optimizer.zero_grad()
-
-    accumulated_loss = 0.0
-    accumulated_entropy = 0.0
-
-    for epoch in range(args.epochs):
-        for idx, batch_tensors in enumerate(train_loader):
-            input_ids = batch_tensors["input_ids"].to(device)
-            labels = batch_tensors["labels"].to(device)
-            response_mask = batch_tensors["response_mask"].to(device)
-
-            # PyTorch Forward Pass
-            log_probs_output = get_response_log_probs(
-                model=model,
-                input_ids=input_ids,
-                labels=labels,
-                return_token_entropy=True,
-            )
-            policy_log_probs = log_probs_output["log_probs"]
-
-            # Compute SFT gradient loss microbatch
-            scaled_loss, metadata = sft_microbatch_train_step(
-                policy_log_probs=policy_log_probs,
-                response_mask=response_mask,
-                gradient_accumulation_steps=args.gradient_accumulation_steps,
-                normalize_constant=response_mask.sum(dim=-1)  # yield proper token averages!
-            )
-
-            accumulated_loss += (
-                metadata["loss"].item() / args.gradient_accumulation_steps
-            )
-            accumulated_entropy += (
-                log_probs_output.get("token_entropy", torch.tensor(0.0)).mean().item()
-                / args.gradient_accumulation_steps
-            )
-
-            if (idx + 1) % args.gradient_accumulation_steps == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), args.max_grad_norm
-                )
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                train_step += 1
-
-                wandb.log(
-                    {
-                        "train_step": train_step,
-                        "train/lr": scheduler.get_last_lr()[0],
-                        "train/loss": accumulated_loss,
-                        "train/token_entropy": accumulated_entropy,
-                        "train/grad_norm": grad_norm.item()
-                        if not isinstance(grad_norm, float)
-                        else grad_norm,
-                    }
-                )
-
-                logger.info(
-                    f"Epoch {epoch} | Step {train_step} | Loss: {accumulated_loss:.4f}"
-                )
-
-                accumulated_loss = 0.0
-                accumulated_entropy = 0.0
-
-                # Periodic Evaluation
-                if train_step % args.eval_steps == 0 or train_step == total_steps:
-                    eval_step += 1
-                    model.eval()
-
-                    accuracy = evaluate_vllm_loop(
-                        model,
-                        vllm_engine,
-                        val_records,
-                    )
-
-                    wandb.log({"eval_step": eval_step, "eval/accuracy": accuracy})
-
-                    save_path = os.path.join(
-                        args.output_dir, f"checkpoint-{train_step}"
-                    )
-                    model.save_pretrained(save_path)
-                    tokenizer.save_pretrained(save_path)
-                    logger.info(f"Saved checkpoint to {save_path}")
-
-                    model.train()
 
 
 if __name__ == "__main__":
