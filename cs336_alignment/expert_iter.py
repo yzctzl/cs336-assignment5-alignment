@@ -146,7 +146,7 @@ def main():
     global_train_step = 0
     # Expert Iteration outer loop
     for ei_step in range(1, args.n_ei_steps + 1):
-        logger.info(f"\n{'=' * 60}")
+        logger.info(f"{'=' * 60}")
         logger.info(f"EI Step {ei_step} / {args.n_ei_steps}")
         logger.info(f"{'=' * 60}")
 
