@@ -4,15 +4,14 @@ import os
 import random
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.sft import (
     evaluate_vllm_loop,
-    init_vllm,
     load_policy_into_vllm_instance,
+    setup_hf_and_vllm,
     sft_train_loop,
 )
 from cs336_alignment.utils import load_MATH
@@ -110,22 +109,13 @@ def main():
         project="cs336-assignment5-alignment-ei", name=args.run_name, config=vars(args)
     )
 
-    # Load model & tokenizer
-    logger.info(f"Loading model from {args.model_name_or_path} ...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path, padding_side="right"
+    model, tokenizer, vllm_engine = setup_hf_and_vllm(
+        model_name_or_path=args.model_name_or_path,
+        device=device,
+        seed=args.seed,
+        vllm_gpu_memory_utilization=0.35,
+        vllm_max_model_len=2048,
     )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    ).to(device)
-
-    # Init vLLM
-    vllm_engine = init_vllm(args.model_name_or_path, device=str(device))
 
     # Load data
     train_records = load_MATH(args.train_data_path, args.prompt_path, -1)

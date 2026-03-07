@@ -76,6 +76,36 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     llm_model.load_weights(state_dict.items())
 
 
+def setup_hf_and_vllm(
+    model_name_or_path: str,
+    device: str | torch.device,
+    seed: int = 42,
+    vllm_gpu_memory_utilization: float = 0.35,
+    vllm_max_model_len: int = 2048,
+) -> tuple[PreTrainedModel, PreTrainedTokenizer, LLM]:
+    """Helper to load PyTorch model, tokenizer, and equivalent vLLM engine."""
+    logger.info(f"Loading {model_name_or_path} ...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="right")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    ).to(device)
+
+    vllm_engine = init_vllm(
+        model_name_or_path,
+        device=str(device),
+        seed=seed,
+        gpu_memory_utilization=vllm_gpu_memory_utilization,
+        max_model_len=vllm_max_model_len,
+    )
+
+    return model, tokenizer, vllm_engine
+
+
 def sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
@@ -345,26 +375,12 @@ def main():
     wandb.define_metric("train/*", step_metric="train_step")
     wandb.define_metric("eval/*", step_metric="eval_step")
 
-    # Load Model & Tokenizer (PyTorch Training Pool)
-    logger.info(f"Loading {args.model_name_or_path} for PyTorch ...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path, padding_side="right"
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    ).to(device)
-
-    # Init vLLM (vLLM Evaluation Pool - Restricting to 0.35)
-    vllm_engine = init_vllm(
-        args.model_name_or_path,
-        device=str(device),
-        gpu_memory_utilization=0.35,
-        max_model_len=2048,
+    model, tokenizer, vllm_engine = setup_hf_and_vllm(
+        model_name_or_path=args.model_name_or_path,
+        device=device,
+        seed=42,
+        vllm_gpu_memory_utilization=0.35,
+        vllm_max_model_len=2048,
     )
 
     # Load Data
