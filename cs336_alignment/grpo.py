@@ -1,7 +1,7 @@
 import logging
 import os
 import random
-from typing import Callable, Literal
+from typing import Annotated, Callable, Literal
 
 import torch
 import typer
@@ -304,7 +304,7 @@ def generate_and_flatten_rollouts(
     prompts = [q["prompt"] for q in questions_batch]
     ground_truths = [str(q.get("ground_truth", "")) for q in questions_batch]
 
-    outputs = vllm_engine.generate(prompts, sampling_params)
+    outputs = vllm_engine.generate(prompts, sampling_params, use_tqdm=False)
 
     rollout_responses = []
     repeated_ground_truths = []
@@ -348,6 +348,7 @@ def grpo_train_loop(
     val_data_path: str = "data/MATH/validation.jsonl",
     prompt_path: str = "cs336_alignment/prompts/r1_zero.prompt",
     output_dir: str = "output/grpo",
+    save_best: bool = False,
     n_grpo_steps: int = 200,
     learning_rate: float = 1e-5,
     advantage_eps: float = 1e-6,
@@ -360,11 +361,11 @@ def grpo_train_loop(
     train_batch_size: int = 256,  # On-policy
     gradient_accumulation_steps: int = 128,  # microbatch size is 2, will fit on H100
     gpu_memory_utilization: float = 0.35,
-    loss_type: Literal[
+    loss_type: Annotated[Literal[
         "no_baseline",
         "reinforce_with_baseline",
         "grpo_clip",
-    ] = "reinforce_with_baseline",
+    ], typer.Option()] = "reinforce_with_baseline",
     use_std_normalization: bool = True,
     seed: int = 42,
     eval_steps: int = 10,
@@ -428,13 +429,13 @@ def grpo_train_loop(
             acc = evaluate_vllm_loop(policy, vllm_engine, val_records)
             wandb.log({"eval/accuracy": acc, "step": step})
             logger.info(f"Step {step} Accuracy: {acc:.4f}")
-            # if acc > best_acc:
-            #     best_acc = acc
-            #     save_path = os.path.join(output_dir, "best_model")
-            #     os.makedirs(save_path, exist_ok=True)
-            #     policy.save_pretrained(save_path)
-            #     tokenizer.save_pretrained(save_path)
-            #     logger.info(f"Saved best model to {save_path} with accuracy {acc:.4f}")
+            if save_best and acc > best_acc:
+                best_acc = acc
+                save_path = os.path.join(output_dir, "best_model")
+                os.makedirs(save_path, exist_ok=True)
+                policy.save_pretrained(save_path)
+                tokenizer.save_pretrained(save_path)
+                logger.info(f"Saved best model to {save_path} with accuracy {acc:.4f}")
 
         policy.eval()
 

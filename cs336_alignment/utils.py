@@ -109,9 +109,10 @@ def get_response_log_probs(
                 or padding; that is done in the train loop.
     """
     logits = model(input_ids).logits
-    log_p = torch.log_softmax(logits, dim=-1)
-    # Gather the log probabilities of the actual label tokens
-    log_probs = torch.gather(log_p, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    # Calculate log_probs without allocating a [B, S, V] tensor for log_p
+    log_sum_exp = torch.logsumexp(logits, dim=-1)
+    gathered = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    log_probs = gathered - log_sum_exp
 
     result = {"log_probs": log_probs}
     if return_token_entropy:
