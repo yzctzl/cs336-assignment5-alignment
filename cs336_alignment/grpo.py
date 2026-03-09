@@ -304,7 +304,7 @@ def generate_and_flatten_rollouts(
     prompts = [q["prompt"] for q in questions_batch]
     ground_truths = [str(q.get("ground_truth", "")) for q in questions_batch]
 
-    outputs = vllm_engine.generate(prompts, sampling_params, use_tqdm=False)
+    outputs = vllm_engine.generate(prompts, sampling_params)
 
     rollout_responses = []
     repeated_ground_truths = []
@@ -360,7 +360,7 @@ def grpo_train_loop(
     epochs_per_rollout_batch: int = 1,  # On-policy
     train_batch_size: int = 256,  # On-policy
     gradient_accumulation_steps: int = 128,  # microbatch size is 2, will fit on H100
-    gpu_memory_utilization: float = 0.35,
+    gpu_memory_utilization: float = 0.2,
     loss_type: Annotated[Literal[
         "no_baseline",
         "reinforce_with_baseline",

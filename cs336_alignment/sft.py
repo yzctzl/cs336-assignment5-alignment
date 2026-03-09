@@ -2,10 +2,14 @@ import argparse
 import json
 import logging
 import os
+
+os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
 from unittest.mock import patch
 
 import torch
 import torch.optim as optim
+from torch.utils._pytree import tree_map
 from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
@@ -15,7 +19,7 @@ from transformers import (
 from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils import PreTrainedTokenizer
 from vllm import LLM, SamplingParams
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
+from vllm.model_executor.utils import set_random_seed as vllm_set_random_seed
 
 import wandb
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
@@ -37,7 +41,7 @@ def init_vllm(
     model_id: str,
     device: str,
     seed: int = 42,
-    gpu_memory_utilization: float = 0.35,
+    gpu_memory_utilization: float = 0.3,
     max_model_len: int = 2048,
 ):
     """
@@ -48,17 +52,17 @@ def init_vllm(
 
     # Monkeypatch to ensure safe startup on single-GPU without DDP interference
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None,
-    )
-    with world_size_patch, profiling_patch:
+    # profiling_patch = patch(
+    #     "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+    #     return_value=None,
+    # )
+    with world_size_patch:
         logger.info(
             f"Initializing vLLM on {device} with memory util={gpu_memory_utilization}"
         )
         return LLM(
             model=model_id,
-            device=device,
+            # device=device,
             dtype="bfloat16",
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -69,18 +73,26 @@ def init_vllm(
 
 def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     """
-    Sync weights from the PyTorch SFT policy directly into the vLLM engine instance.
+    Sync weights from the PyTorch SFT policy into the vLLM engine instance.
+    Optimized: Direct in-memory transfer via RPC closure to bypass disk I/O.
     """
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model  # ty:ignore[unresolved-attribute]
-    llm_model.load_weights(state_dict.items())
+    # state_dict = {k: v.detach().cpu() for k, v in policy.state_dict().items()}
+    state_dict = tree_map(lambda t: t.to("cpu", non_blocking=True), policy.state_dict())
+
+    def _in_memory_weight_loader(model):
+        model.load_weights(state_dict.items())
+        torch.cuda.empty_cache()
+        return True
+
+    llm.llm_engine.apply_model(_in_memory_weight_loader)
+
 
 
 def setup_hf_and_vllm(
     model_name_or_path: str,
     device: str | torch.device,
     seed: int = 42,
-    vllm_gpu_memory_utilization: float = 0.35,
+    vllm_gpu_memory_utilization: float = 0.3,
     vllm_max_model_len: int = 2048,
 ) -> tuple[PreTrainedModel, PreTrainedTokenizer, LLM]:
     """Helper to load PyTorch model, tokenizer, and equivalent vLLM engine."""
@@ -91,9 +103,14 @@ def setup_hf_and_vllm(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
-    ).to(device)
+    ).to(device)  # ty:ignore[invalid-argument-type]
+
+    # Enable gradient checkpointing to save VRAM during backward pass
+    model.gradient_checkpointing_enable()
+    # Gradient checkpointing is incompatible with KV cache usage
+    model.config.use_cache = False
 
     vllm_engine = init_vllm(
         model_name_or_path,

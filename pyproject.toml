@@ -7,17 +7,17 @@ requires-python = ">=3.11,<3.13"  # Python 3.13 not yet supported for some deps
 dependencies = [
     "accelerate>=1.5.2",
     "alpaca-eval",
-    "flash-attn==2.7.4.post1",
+    "flash-attn==2.8.3",
     "jupyter>=1.1.1",
     "math-verify[antlr4-13-2]>=0.7.0",
-    "pylatexenc==2.10",
+    "pylatexenc>=2.10",
     "notebook>=7.4.2",
     "pytest>=8.3.5",
-    "torch",
+    "torch==2.8.0",
     "tqdm>=4.67.1",
     "transformers>=4.50.0",
     "typer>=0.19.0",
-    "vllm==0.7.2",
+    "vllm>=0.8.0",
     "wandb>=0.19.8",
     "xopen>=2.0.2",
 ]
@@ -39,5 +39,5 @@ log_cli_level = "WARNING"
 
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
-version = "2.7.4.post1"
+version = "2.8.3"
 requires-dist = ["torch", "einops", "setuptools"]
