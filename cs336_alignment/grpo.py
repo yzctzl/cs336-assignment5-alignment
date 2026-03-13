@@ -4,11 +4,12 @@ import random
 from typing import Annotated, Callable, Literal
 
 import torch
+import torch.distributed as dist
 import typer
 from vllm import SamplingParams
 
 import wandb
-from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.drgrpo_grader import question_only_reward_fn, r1_zero_reward_fn
 from cs336_alignment.sft import (
     evaluate_vllm_loop,
     load_policy_into_vllm_instance,
@@ -17,6 +18,7 @@ from cs336_alignment.sft import (
 from cs336_alignment.utils import (
     get_response_log_probs,
     load_MATH,
+    masked_normalize,
     tokenize_prompt_and_output,
 )
 
@@ -25,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda"  # if torch.cuda.is_available() else "cpu"
 
 
 def compute_group_normalized_rewards(
@@ -199,6 +201,12 @@ def compute_policy_gradient_loss(
         return compute_grpo_clip_loss(
             advantages, policy_log_probs, old_log_probs, cliprange
         )
+    elif loss_type == "grpo_no_clip":
+        # Off-policy ratio loss WITHOUT clipping (ablation for grpo_off_policy_clip_ablation)
+        # Loss = -(pi_theta / pi_theta_old) * advantage, per token
+        ratio = torch.exp(policy_log_probs - old_log_probs)
+        pg_loss = -(ratio * advantages)
+        return (pg_loss, {})
     else:
         raise NotImplementedError
 
@@ -231,11 +239,12 @@ def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
-    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"],
     raw_rewards: torch.Tensor | None = None,
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    normalize_constant: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch.
 
@@ -263,14 +272,17 @@ def grpo_microbatch_train_step(
         tuple[torch.Tensor, dict[str, torch.Tensor]]:
             the policy gradient loss and its metadata.
     """
-    if loss_type not in ("no_baseline", "reinforce_with_baseline", "grpo_clip"):
+    if loss_type not in ("no_baseline", "reinforce_with_baseline", "grpo_clip", "grpo_no_clip"):
         raise NotImplementedError
 
     per_token_loss, metadata = compute_policy_gradient_loss(
         policy_log_probs, loss_type,
         raw_rewards, advantages, old_log_probs, cliprange,  # ty:ignore[invalid-argument-type]
     )
-    batch_loss = masked_mean(per_token_loss, response_mask, dim=-1)
+    if normalize_constant is not None:
+        batch_loss = masked_normalize(per_token_loss, response_mask, normalize_constant, dim=-1)
+    else:
+        batch_loss = masked_mean(per_token_loss, response_mask, dim=-1)
 
     # mean loss across sequence
     actual_loss = batch_loss.mean()
@@ -350,7 +362,7 @@ def grpo_train_loop(
     output_dir: str = "output/grpo",
     save_best: bool = False,
     n_grpo_steps: int = 200,
-    learning_rate: float = 1e-5,
+    learning_rate: float = 4e-5,
     advantage_eps: float = 1e-6,
     rollout_batch_size: int = 256,
     group_size: int = 8,
@@ -365,16 +377,22 @@ def grpo_train_loop(
         "no_baseline",
         "reinforce_with_baseline",
         "grpo_clip",
+        "grpo_no_clip",
     ], typer.Option()] = "reinforce_with_baseline",
     use_std_normalization: bool = True,
+    constant_normalize_factor: float | None = None,
+    use_question_only_reward: bool = False,
     seed: int = 42,
     eval_steps: int = 10,
     clip_range: float = 0.2,  # DeepSeek's cliprange param for GRPO-Clip
     max_grad_norm: float = 1.0,
+    run_name: str | None = None,
 ):
     random.seed(seed)
     torch.manual_seed(seed)
 
+    # Select reward function based on flag
+    reward_fn = question_only_reward_fn if use_question_only_reward else r1_zero_reward_fn
     assert train_batch_size % gradient_accumulation_steps == 0, (
         "train_batch_size must be divisible by gradient_accumulation_steps"
     )
@@ -388,7 +406,11 @@ def grpo_train_loop(
     )
     n_microbatches_per_rollout_batch = rollout_batch_size // micro_train_batch_size
 
-    wandb.init(project="cs336-assignment5-alignment-grpo", config=locals())
+    wandb.init(
+        project="cs336-assignment5-alignment-grpo",
+        name=run_name,
+        config=locals(),
+    )
 
     policy, tokenizer, vllm_engine = setup_hf_and_vllm(
         model_name_or_path=model_name_or_path,
@@ -449,7 +471,7 @@ def grpo_train_loop(
 
         # Compute rewards (reward_fn is called only once inside)
         rewards, raw_rewards, reward_metadata = compute_group_normalized_rewards(
-            r1_zero_reward_fn,
+            reward_fn,
             rollout_responses,
             repeated_ground_truths,
             group_size,
@@ -464,8 +486,8 @@ def grpo_train_loop(
             repeated_prompts, rollout_responses, tokenizer
         )
 
-        # Precompute old_log_probs if off-policy clip
-        if loss_type == "grpo_clip":
+        # Precompute old_log_probs for off-policy ratio-based losses (clip and no-clip)
+        if loss_type in ("grpo_clip", "grpo_no_clip"):
             old_log_probs = get_batched_log_probs(
                 policy,
                 batch_tensors["input_ids"].to(DEVICE),
@@ -529,6 +551,7 @@ def grpo_train_loop(
                         advantages=mb_rewards,
                         old_log_probs=mb_old_log_probs,
                         cliprange=clip_range,
+                        normalize_constant=constant_normalize_factor,
                     )
 
                     accu_loss += micro_loss.item()
@@ -572,6 +595,10 @@ def grpo_train_loop(
     tokenizer.save_pretrained(save_path)
     logger.info(f"Saved final model to {save_path}")
     wandb.finish()
+
+    # destroy_process_group
+    if dist.is_initialized():  # ty:ignore[possibly-missing-attribute]
+        dist.destroy_process_group()  # ty:ignore[possibly-missing-attribute]
 
 
 if __name__ == "__main__":
